@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>포즈로 조종하는 뱀게임</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif;
+    background: #111827;
+    color: #e5e7eb;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px;
+  }
+  h1 { margin: 0 0 12px; font-size: 26px; }
+  .wrap { display: flex; gap: 24px; flex-wrap: wrap; justify-content: center; }
+  .panel {
+    background: #1f2937;
+    border-radius: 12px;
+    padding: 16px;
+  }
+  #game { background: #0b1220; border-radius: 8px; display: block; }
+  #webcam-container canvas { border-radius: 8px; display: block; }
+  .info { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 18px; }
+  .bar-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-size: 14px; }
+  .bar-row .name { width: 52px; }
+  .bar { flex: 1; height: 16px; background: #374151; border-radius: 8px; overflow: hidden; }
+  .bar > div { height: 100%; width: 0; background: #6b7280; transition: width .1s; }
+  .bar-row.active .bar > div { background: #22c55e; }
+  .bar-row .pct { width: 40px; text-align: right; }
+  #current { font-size: 32px; text-align: center; margin: 10px 0; font-weight: bold; }
+  button {
+    background: #22c55e; color: #052e16; border: none;
+    padding: 10px 18px; font-size: 16px; font-weight: bold;
+    border-radius: 8px; cursor: pointer; margin: 4px;
+  }
+  button:disabled { background: #4b5563; color: #9ca3af; cursor: default; }
+  label { font-size: 14px; display: block; margin-top: 10px; }
+  input[type=range] { width: 100%; }
+  #status { font-size: 13px; color: #9ca3af; margin-top: 8px; min-height: 18px; }
+  .overlay-msg { text-align: center; margin-top: 8px; font-size: 18px; min-height: 24px; color: #fbbf24; }
+</style>
+</head>
+<body>
+<h1>🐍 포즈로 조종하는 뱀게임</h1>
+
+<div class="wrap">
+  <div class="panel">
+    <div class="info">
+      <span>점수: <b id="score">0</b></span>
+      <span>최고: <b id="best">0</b></span>
+    </div>
+    <canvas id="game" width="400" height="400"></canvas>
+    <div class="overlay-msg" id="msg">‘웹캠 시작’을 누르세요</div>
+    <div style="text-align:center">
+      <button id="camBtn">웹캠 시작</button>
+      <button id="startBtn" disabled>게임 시작</button>
+    </div>
+  </div>
+
+  <div class="panel" style="width:300px">
+    <div id="webcam-container"></div>
+    <div id="current">-</div>
+    <div id="bars"></div>
+    <label>인식 기준 확률: <span id="thVal">0.80</span>
+      <input type="range" id="threshold" min="0.5" max="0.99" step="0.01" value="0.8">
+    </label>
+    <label>뱀 속도 (ms/칸): <span id="spVal">300</span>
+      <input type="range" id="speed" min="80" max="600" step="10" value="300">
+    </label>
+    <div id="status">키보드 방향키로도 조종 가능</div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@teachablemachine/pose@0.8/dist/teachablemachine-pose.min.js"></script>
+<script>
+const MODEL_URL = "https://teachablemachine.withgoogle.com/models/H8p2jpewz/";
+
+// 모델 클래스 이름 → 방향
+const LABEL_TO_DIR = {
+  "위쪽":   { x: 0,  y: -1, arrow: "⬆️ 위" },
+  "아래쪽": { x: 0,  y: 1,  arrow: "⬇️ 아래" },
+  "왼쪽":   { x: -1, y: 0,  arrow: "⬅️ 왼쪽" },
+  "오른쪽": { x: 1,  y: 0,  arrow: "➡️ 오른쪽" },
+  "중립":   null,
+};
+
+// ---------------- 포즈 모델 ----------------
+let model, webcam, ctxCam, maxPredictions;
+let threshold = 0.8;
+
+async function initCam() {
+  const camBtn = document.getElementById("camBtn");
+  camBtn.disabled = true;
+  setStatus("모델 불러오는 중...");
+  try {
+    model = await tmPose.load(MODEL_URL + "model.json", MODEL_URL + "metadata.json");
+    maxPredictions = model.getTotalClasses();
+
+    const size = 268;
+    webcam = new tmPose.Webcam(size, size, true); // 좌우 반전
+    await webcam.setup();
+    await webcam.play();
+
+    const canvas = document.createElement("canvas");
+    canvas.width = size; canvas.height = size;
+    ctxCam = canvas.getContext("2d");
+    document.getElementById("webcam-container").appendChild(canvas);
+
+    buildBars(model.getClassLabels());
+    camBtn.textContent = "웹캠 실행 중";
+    document.getElementById("startBtn").disabled = false;
+    setMsg("‘게임 시작’을 누르세요");
+    setStatus("준비 완료! (키보드 방향키도 사용 가능)");
+    window.requestAnimationFrame(camLoop);
+  } catch (e) {
+    console.error(e);
+    camBtn.disabled = false;
+    setStatus("오류: " + e.message + " — localhost(http 서버)에서 열었는지 확인하세요.");
+  }
+}
+
+async function camLoop() {
+  webcam.update();
+  await predict();
+  window.requestAnimationFrame(camLoop);
+}
+
+async function predict() {
+  const { pose, posenetOutput } = await model.estimatePose(webcam.canvas);
+  const prediction = await model.predict(posenetOutput);
+
+  let best = prediction[0];
+  for (const p of prediction) if (p.probability > best.probability) best = p;
+
+  prediction.forEach((p, i) => {
+    const row = document.getElementById("bar-" + i);
+    row.querySelector(".bar > div").style.width = (p.probability * 100) + "%";
+    row.querySelector(".pct").textContent = Math.round(p.probability * 100) + "%";
+    row.classList.toggle("active", p === best && p.probability >= threshold);
+  });
+
+  if (best.probability >= threshold) {
+    const dir = LABEL_TO_DIR[best.className];
+    document.getElementById("current").textContent = dir ? dir.arrow : "⏺ 중립";
+    if (dir) requestDirection(dir.x, dir.y);
+  }
+
+  drawPose(pose);
+}
+
+function drawPose(pose) {
+  ctxCam.drawImage(webcam.canvas, 0, 0);
+  if (pose) {
+    tmPose.drawKeypoints(pose.keypoints, 0.5, ctxCam);
+    tmPose.drawSkeleton(pose.keypoints, 0.5, ctxCam);
+  }
+}
+
+function buildBars(labels) {
+  const box = document.getElementById("bars");
+  box.innerHTML = "";
+  labels.forEach((name, i) => {
+    box.insertAdjacentHTML("beforeend",
+      `<div class="bar-row" id="bar-${i}">
+         <span class="name">${name}</span>
+         <div class="bar"><div></div></div>
+         <span class="pct">0%</span>
+       </div>`);
+  });
+}
+
+// ---------------- 뱀게임 ----------------
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const CELL = 20;
+const COLS = canvas.width / CELL;
+const ROWS = canvas.height / CELL;
+
+let snake, dir, nextDir, food, score, running = false, timer = null;
+let tickMs = 300;
+let best = Number(localStorageGet("snakeBest") || 0);
+document.getElementById("best").textContent = best;
+
+function resetGame() {
+  snake = [{ x: 10, y: 10 }, { x: 9, y: 10 }, { x: 8, y: 10 }];
+  dir = { x: 1, y: 0 };
+  nextDir = { x: 1, y: 0 };
+  score = 0;
+  document.getElementById("score").textContent = 0;
+  placeFood();
+}
+
+function placeFood() {
+  do {
+    food = { x: Math.floor(Math.random() * COLS), y: Math.floor(Math.random() * ROWS) };
+  } while (snake.some(s => s.x === food.x && s.y === food.y));
+}
+
+// 반대 방향으로는 바로 못 꺾게
+function requestDirection(x, y) {
+  if (!running) return;
+  if (x === -dir.x && y === -dir.y) return;
+  nextDir = { x, y };
+}
+
+function startGame() {
+  resetGame();
+  running = true;
+  setMsg("");
+  document.getElementById("startBtn").textContent = "다시 시작";
+  restartTimer();
+}
+
+function restartTimer() {
+  clearInterval(timer);
+  if (running) timer = setInterval(step, tickMs);
+}
+
+function step() {
+  dir = nextDir;
+  const head = { x: snake[0].x + dir.x, y: snake[0].y + dir.y };
+
+  if (head.x < 0 || head.y < 0 || head.x >= COLS || head.y >= ROWS ||
+      snake.some(s => s.x === head.x && s.y === head.y)) {
+    return gameOver();
+  }
+
+  snake.unshift(head);
+  if (head.x === food.x && head.y === food.y) {
+    score++;
+    document.getElementById("score").textContent = score;
+    placeFood();
+  } else {
+    snake.pop();
+  }
+  draw();
+}
+
+function gameOver() {
+  running = false;
+  clearInterval(timer);
+  if (score > best) {
+    best = score;
+    localStorageSet("snakeBest", best);
+    document.getElementById("best").textContent = best;
+  }
+  draw();
+  ctx.fillStyle = "rgba(0,0,0,0.6)";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 36px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("GAME OVER", canvas.width / 2, canvas.height / 2);
+  setMsg("점수 " + score + "점! ‘다시 시작’을 누르세요");
+}
+
+function draw() {
+  ctx.fillStyle = "#0b1220";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // 격자
+  ctx.strokeStyle = "#162033";
+  for (let i = 0; i <= COLS; i++) {
+    ctx.beginPath(); ctx.moveTo(i * CELL, 0); ctx.lineTo(i * CELL, canvas.height); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, i * CELL); ctx.lineTo(canvas.width, i * CELL); ctx.stroke();
+  }
+
+  // 먹이
+  ctx.fillStyle = "#ef4444";
+  ctx.beginPath();
+  ctx.arc(food.x * CELL + CELL / 2, food.y * CELL + CELL / 2, CELL / 2 - 2, 0, Math.PI * 2);
+  ctx.fill();
+
+  // 뱀
+  snake.forEach((s, i) => {
+    ctx.fillStyle = i === 0 ? "#86efac" : "#22c55e";
+    ctx.fillRect(s.x * CELL + 1, s.y * CELL + 1, CELL - 2, CELL - 2);
+  });
+}
+
+// ---------------- 입력 / UI ----------------
+document.addEventListener("keydown", e => {
+  const map = { ArrowUp: [0, -1], ArrowDown: [0, 1], ArrowLeft: [-1, 0], ArrowRight: [1, 0] };
+  if (map[e.key]) { e.preventDefault(); requestDirection(...map[e.key]); }
+  if (e.key === " " && !running) startGame();
+});
+
+document.getElementById("camBtn").onclick = initCam;
+document.getElementById("startBtn").onclick = startGame;
+
+document.getElementById("threshold").oninput = e => {
+  threshold = Number(e.target.value);
+  document.getElementById("thVal").textContent = threshold.toFixed(2);
+};
+document.getElementById("speed").oninput = e => {
+  tickMs = Number(e.target.value);
+  document.getElementById("spVal").textContent = tickMs;
+  restartTimer();
+};
+
+function setMsg(t) { document.getElementById("msg").textContent = t; }
+function setStatus(t) { document.getElementById("status").textContent = t; }
+function localStorageGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
+function localStorageSet(k, v) { try { localStorage.setItem(k, v); } catch {} }
+
+resetGame();
+draw();
+</script>
+</body>
+</html>
